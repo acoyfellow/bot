@@ -1,6 +1,8 @@
 <script lang="ts">
   import PartySocket from "partysocket";
   import { onMount } from "svelte";
+  import README from "../README.md";
+  // import { compile } from 'mdsvex';
 
   let analyzeResult = $state("");
   let prResult = $state("");
@@ -8,20 +10,23 @@
   let error = $state("");
   let socket: PartySocket;
 
-  onMount(() => {
+  onMount(async () => {
     socket = new PartySocket({
       host: window.location.host,
       room: "room1",
       party: "my-server",
     });
 
-    socket.addEventListener("message", (event) => {
+    socket.addEventListener("message", async (event) => {
       const data = JSON.parse(event.data);
       loading = false;
 
       switch (data.type) {
         case "analyzeResult":
           analyzeResult = data.suggestion;
+          break;
+        case "suggestedChanges":
+          console.log("suggestedChanges", data.changes);
           break;
         case "prResult":
           prResult = `PR created: ${data.pr.html_url}`;
@@ -51,11 +56,10 @@
   }
 </script>
 
-<main
-  class="flex flex-col items-center justify-center min-h-screen p-4 space-y-6"
->
-  <h1 class="text-4xl font-bold">🤖</h1>
-  <p class="text-2xl font-bold">GitHub Bot</p>
+<main class="prose p-4 space-y-6 max-w-xl mx-auto py-20">
+  <README />
+
+  <hr />
 
   <div class="flex flex-col items-center space-y-4 w-full max-w-md">
     <button
@@ -69,7 +73,7 @@
     {#if analyzeResult}
       <div class="w-full p-4 bg-gray-100 rounded">
         <h3 class="font-bold mb-2">Suggestion:</h3>
-        <p>{analyzeResult}</p>
+        <p class="whitespace-pre-wrap">{analyzeResult}</p>
       </div>
 
       <button

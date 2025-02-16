@@ -3,7 +3,6 @@
   "name": "bot",
   "main": "./worker/server.ts",
   "compatibility_date": "2025-02-04",
-  "account_id": "bfcb6ac5b3ceaf42a09607f6f7925823",
   "assets": {
     "directory": "./public"
   },

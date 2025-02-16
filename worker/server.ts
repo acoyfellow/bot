@@ -1,9 +1,13 @@
 import { Server, type Connection, routePartykitRequest } from "partyserver"
+import { OpenAI } from "openai"
 
-type Env = {
-  MyServer: DurableObjectNamespace<MyServer>;
+const model = "gpt-4o-mini";
+
+interface Env {
   OPENAI_API_KEY: string;
   GITHUB_TOKEN: string;
+  MyServer: DurableObjectNamespace<MyServer>;
+  BUN_VERSION: string;
 }
 
 type BotCommand =
@@ -15,9 +19,27 @@ type BotResponse =
   | { type: 'prResult'; pr: { html_url: string } }
   | { type: 'error'; message: string };
 
+interface FileChange {
+  file: string;
+  description: string;
+  content: string;
+}
+
+interface ChangeSet {
+  changes: FileChange[];
+}
+
 export class MyServer extends Server<Env> {
   private codebase: string = "";
   private suggestion: string = "";
+  private openAiApiKey: string = "";
+  private githubToken: string = "";
+
+  onConnect(connection: Connection) {
+    this.openAiApiKey = this.env.OPENAI_API_KEY;
+    this.githubToken = this.env.GITHUB_TOKEN;
+    console.log('onConnect', { openAiApiKey: this.openAiApiKey, githubToken: this.githubToken });
+  }
 
   async onMessage(conn: Connection, message: string) {
     try {
@@ -44,9 +66,11 @@ export class MyServer extends Server<Env> {
       this.codebase = code;
       const suggestion = await this.generateSuggestion(code);
       this.suggestion = suggestion;
+      console.log({ suggestion });
 
       this.sendMessage(conn, { type: 'analyzeResult', suggestion });
     } catch (error) {
+      console.error(error);
       this.sendError(conn, 'Failed to analyze code');
     }
   }
@@ -58,7 +82,12 @@ export class MyServer extends Server<Env> {
     }
 
     try {
-      const prResult = await this.createPullRequest(this.suggestion);
+      // First, convert the suggestion into structured changes
+      const changes = await this.generateChanges(this.suggestion);
+      this.sendMessage(conn, { type: 'suggestedChanges', changes });
+      console.log({ changes });
+      // Then create the PR with those changes
+      const prResult = await this.createPullRequest(changes);
       this.suggestion = "";
       this.sendMessage(conn, { type: 'prResult', pr: prResult });
     } catch (error) {
@@ -67,18 +96,202 @@ export class MyServer extends Server<Env> {
   }
 
   private async fetchCodebase(): Promise<string> {
-    // TODO: Implement GitHub API call to fetch README.md
-    return "mock codebase content";
+    const baseUrl = "https://api.github.com/repos/acoyfellow/bot/contents";
+    let allCode = "";
+
+    async function fetchDirectory(path: string = ""): Promise<void> {
+      try {
+        const response = await fetch(`${baseUrl}${path}`, {
+          headers: {
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "bot"
+          }
+        });
+
+        if (!response.ok) {
+          throw new Error(`GitHub API error: ${response.status}`);
+        }
+
+        const items = await response.json();
+
+        for (const item of items) {
+          if (item.type === "file") {
+            // Skip node_modules, dist, and other common ignored directories
+            if (item.path.includes("node_modules") ||
+              item.path.includes("bun.lock") ||
+              item.path.includes("dist") ||
+              item.path.endsWith(".env")) {
+              continue;
+            }
+            const contentResponse = await fetch(item.download_url);
+            const content = await contentResponse.text();
+            allCode += `\n\nFile: ${item.path}\n${content}`;
+          } else if (item.type === "dir") {
+            await fetchDirectory(`/${item.path}`);
+          }
+        }
+      } catch (error) {
+        console.error('Fetch error:', error);
+        throw error;
+      }
+    }
+
+    await fetchDirectory();
+    return allCode;
   }
 
   private async generateSuggestion(code: string): Promise<string> {
-    // TODO: Implement OpenAI API call
-    return "mock suggestion";
+    const openai = new OpenAI({
+      apiKey: this.openAiApiKey
+    });
+
+    try {
+      const chatCompletion = await openai.chat.completions.create({
+        model,
+        messages: [
+          {
+            role: "system",
+            content: "You are a cracked out code review assistant. Analyze code and suggest improvements concisely. Only make a suggestion if it's truly an improvement, bugfix, or refactor. If it's not, just ignore the file. when editing a file, think about how to make it simpler. easier to maintain. less code, same functionality. Keep working code working, clean, up to date, readable, and maintainable."
+          },
+          {
+            role: "user",
+            content: `Analyze this code and suggest improvements:\n\n${code}`
+          }
+        ]
+      });
+
+      return chatCompletion.choices[0].message.content;
+    } catch (error) {
+      console.error('OpenAI API error:', error);
+      throw error;
+    }
   }
 
-  private async createPullRequest(suggestion: string): Promise<{ html_url: string }> {
-    // TODO: Implement GitHub API call to create PR
-    return { html_url: "https://github.com/mock/pr" };
+  private async generateChanges(suggestion: string): Promise<ChangeSet> {
+    const openai = new OpenAI({
+      apiKey: this.openAiApiKey
+    });
+
+    try {
+      const response = await openai.chat.completions.create({
+        model,
+        messages: [{
+          role: "system",
+          content: `You are a code improvement assistant. Convert the following suggestion into specific file changes. The content should be the new file content in its entirety, it must be complete.
+            Return a JSON object with this structure:
+            {
+              "changes": [{
+                "file": "path/to/file",
+                "description": "What changed and why",
+                "content": "Complete new file content"
+              }]
+            }`
+        }, {
+          role: "user",
+          content: `Convert this suggestion into specific file changes:\n\n${suggestion}`
+        }],
+        response_format: { type: "json_object" }
+      });
+
+      const result = JSON.parse(response.choices[0].message.content);
+      console.log({ result });
+      if (!result.changes || !Array.isArray(result.changes)) {
+        throw new Error('Invalid change set format');
+      }
+      return result.changes;
+    } catch (error) {
+      console.error('Failed to generate changes:', error);
+      throw error;
+    }
+  }
+
+  private async createPullRequest(changes: ChangeSet): Promise<{ html_url: string }> {
+    try {
+      const branchName = `bot-update-${Date.now()}`;
+      console.log({ branchName, githubToken: this.githubToken });
+
+      // 1. Get the current main branch SHA
+      const mainRef = await fetch(
+        "https://api.github.com/repos/acoyfellow/bot/git/refs/heads/main",
+        {
+          headers: {
+            "Authorization": `Bearer ${this.githubToken}`,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "bot"
+          }
+        }
+      );
+      console.log({ mainRef });
+      const mainRefData = await mainRef.json();
+      console.log({ mainRefData });
+
+      const { object: { sha } } = await mainRef.json();
+
+      // 2. Create new branch from main
+      await fetch(
+        "https://api.github.com/repos/acoyfellow/bot/git/refs",
+        {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${this.githubToken}`,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+          },
+          body: JSON.stringify({
+            ref: `refs/heads/${branchName}`,
+            sha
+          })
+        }
+      );
+
+      // 3. Create a commit for each change
+      for (const change of changes) {
+        await fetch(
+          `https://api.github.com/repos/acoyfellow/bot/contents/${change.file}`,
+          {
+            method: "PUT",
+            headers: {
+              "Authorization": `Bearer ${this.githubToken}`,
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+            },
+            body: JSON.stringify({
+              message: `Update ${change.file}\n\n${change.description}`,
+              content: Buffer.from(change.content).toString('base64'),
+              branch: branchName
+            })
+          }
+        );
+      }
+
+      // 4. Create the PR
+      const pr = await fetch(
+        "https://api.github.com/repos/acoyfellow/bot/pulls",
+        {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${this.githubToken}`,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+          },
+          body: JSON.stringify({
+            title: "Bot Suggested Updates",
+            body: changes.map(change =>
+              `## ${change.file}\n${change.description}\n\n\`\`\`\n${change.content}\n\`\`\``
+            ).join('\n\n'),
+            head: `acoyfellow:${branchName}`,
+            base: "main"
+          })
+        }
+      );
+
+      const prData = await pr.json();
+      return { html_url: prData.html_url };
+    } catch (error) {
+      console.error('GitHub API error:', error);
+      throw error;
+    }
   }
 
   private sendMessage(conn: Connection, message: BotResponse) {
