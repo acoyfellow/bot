@@ -8,8 +8,11 @@ const mainRef = await fetch(
     }
   }
 );
-console.log({ mainRef });
-const mainRefData = await mainRef.json();
-console.log({ mainRefData });
-const { object: { sha } } = mainRefData;
-console.log({ sha });
+
+if (mainRef.ok) {
+  const mainRefData = await mainRef.json();
+  const { object: { sha } } = mainRefData;
+  console.log({ sha });
+} else {
+  console.error('Failed to fetch main branch reference', await mainRef.json());
+}
