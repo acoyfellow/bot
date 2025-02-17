@@ -88,6 +88,7 @@ export class MyServer extends Server<Env> {
       console.log({ changes });
       // Then create the PR with those changes
       const prResult = await this.createPullRequest(changes);
+      console.log({ prResult });
       this.suggestion = "";
       this.sendMessage(conn, { type: 'prResult', pr: prResult });
     } catch (error) {
@@ -222,14 +223,10 @@ export class MyServer extends Server<Env> {
           }
         }
       );
-      console.log({ mainRef });
-      const mainRefData = await mainRef.json();
-      console.log({ mainRefData });
-
       const { object: { sha } } = await mainRef.json();
-
+      console.log({ sha });
       // 2. Create new branch from main
-      await fetch(
+      const newBranch = await fetch(
         "https://api.github.com/repos/acoyfellow/bot/git/refs",
         {
           method: "POST",
@@ -237,6 +234,7 @@ export class MyServer extends Server<Env> {
             "Authorization": `Bearer ${this.githubToken}`,
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "bot"
           },
           body: JSON.stringify({
             ref: `refs/heads/${branchName}`,
@@ -244,10 +242,28 @@ export class MyServer extends Server<Env> {
           })
         }
       );
+      console.log({ newBranch });
 
       // 3. Create a commit for each change
+      console.log('Commiting changes:', changes.length);
       for (const change of changes) {
-        await fetch(
+        // First get the current file's SHA
+        const fileResponse = await fetch(
+          `https://api.github.com/repos/acoyfellow/bot/contents/${change.file}`,
+          {
+            headers: {
+              "Authorization": `Bearer ${this.githubToken}`,
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "bot"
+            }
+          }
+        );
+
+        const fileData = await fileResponse.json();
+
+        // Create the commit with the new content
+        const response = await fetch(
           `https://api.github.com/repos/acoyfellow/bot/contents/${change.file}`,
           {
             method: "PUT",
@@ -255,38 +271,50 @@ export class MyServer extends Server<Env> {
               "Authorization": `Bearer ${this.githubToken}`,
               "Accept": "application/vnd.github+json",
               "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "bot"
             },
             body: JSON.stringify({
               message: `Update ${change.file}\n\n${change.description}`,
-              content: Buffer.from(change.content).toString('base64'),
-              branch: branchName
+              content: btoa(unescape(encodeURIComponent(change.content))), // Fix for Unicode
+              branch: branchName,
+              sha: fileData.sha  // Use file's current SHA
             })
           }
         );
+
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(`Failed to create commit: ${JSON.stringify(error)}`);
+        }
       }
 
-      // 4. Create the PR
-      const pr = await fetch(
-        "https://api.github.com/repos/acoyfellow/bot/pulls",
+      // 4. Create a pull request
+      const prResponse = await fetch(
+        `https://api.github.com/repos/acoyfellow/bot/pulls`,
         {
           method: "POST",
           headers: {
             "Authorization": `Bearer ${this.githubToken}`,
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "bot"
           },
           body: JSON.stringify({
-            title: "Bot Suggested Updates",
-            body: changes.map(change =>
-              `## ${change.file}\n${change.description}\n\n\`\`\`\n${change.content}\n\`\`\``
-            ).join('\n\n'),
-            head: `acoyfellow:${branchName}`,
-            base: "main"
+            title: "Update files",
+            body: changes.map(c => `- ${c.file}: ${c.description}`).join('\n'),
+            head: branchName,
+            base: "main"  // or "master" depending on your default branch
           })
         }
       );
 
-      const prData = await pr.json();
+      if (!prResponse.ok) {
+        const prData = await prResponse.json();
+        throw new Error(`Failed to create PR: ${JSON.stringify(prData)}`);
+      }
+
+      const prData = await prResponse.json();
+      console.log({ prData: JSON.stringify(prData, null, 2) });
       return { html_url: prData.html_url };
     } catch (error) {
       console.error('GitHub API error:', error);
